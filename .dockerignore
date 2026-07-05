@@ -1,0 +1,16 @@
+# Host virtualenv (the project root is itself a venv) — never send to the daemon.
+Scripts/
+Lib/
+Include/
+pyvenv.cfg
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Compose / docs / vcs — not needed in the image
+docker-compose.yml
+README.md
+.git/
+.gitignore

@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:17
+    container_name: aleson-verification-db
+    restart: always
+    environment:
+      POSTGRES_USER: aleson_local
+      POSTGRES_PASSWORD: aleson_local_gate
+      POSTGRES_DB: aleson_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - verification-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aleson_local -d aleson_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    container_name: aleson-verification-api
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Inside the compose network the DB is reachable as db:5432.
+      LOCAL_DATABASE_URL: postgresql://aleson_local:aleson_local_gate@db:5432/aleson_db
+      CLOUD_API_URL: https://aleson-test-2.brylletan.com
+    ports:
+      - "8001:8001"
+
+volumes:
+  verification-postgres-data:
