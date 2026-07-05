@@ -21,19 +21,31 @@ starting.
 
 ## Before each boarding session
 
-1. **Download the ticket data** (needs internet to the central backend —
-   pulls `GET /api/v1/verification/tickets` page by page into the local
-   `verification_tickets` table):
+1. **Download the trip you're boarding** (needs internet to the central
+   backend). Open the gate web page in a browser on the laptop:
+
+   ```
+   http://localhost:8001/
+   ```
+
+   It lists the upcoming trips (closest departure first). Click **Download**
+   on the trip you're boarding — that pulls only that trip's tickets
+   (`GET /api/v1/verification/tickets?trip_id=…`) into the local
+   `verification_tickets` table and shows live boarding progress ("X of Y
+   boarded") as scans come in.
+
+   Command-line equivalents (need a trip id — get one from `GET /trips`):
 
    ```powershell
    # while the stack is up:
-   curl.exe -X POST http://localhost:8001/sync
+   curl.exe -X POST http://localhost:8001/sync -H "Content-Type: application/json" -d "{\"trip_id\": 123}"
    # or run the sync script inside the container:
-   docker compose exec api python -m src.sync
+   docker compose exec api python -m src.sync 123
    ```
 
    The table is rebuilt in a single transaction, so a failed sync leaves the
-   previous copy intact.
+   previous copy intact. Re-downloading a trip resets its boarding marks back
+   to "Not Boarded".
 
 2. **Start the hotspot** (Windows: Settings → Network & internet → Mobile
    hotspot) and connect the tablets to it. Find the laptop's hotspot IP with
@@ -56,11 +68,19 @@ published DB port) instead of the in-network `db:5432`.
 
 | Endpoint | Body | Response |
 |---|---|---|
+| `GET /` | — | HTML gate page: pick a trip, download it, watch boarding progress |
 | `GET /health` | — | `{"status": "ok", "tickets": N}` |
-| `POST /sync` | — | `{"status": "success", "tickets": N}` |
-| `POST /verify` | `{"qr_token": "<scanned string>"}` | success: `{"status": "success", "passenger_name", "route", "vessel", "seat_number", "accommodation_class", "departure", "ticket_status"}` · not found / cancelled / refunded: `{"status": "failed", "reason"}` |
+| `GET /trips` | — | `{"status": "success", "trips": [{id, origin, destination, vessel_name, scheduled_departure, ticket_count, ...}]}` — upcoming trips, closest first |
+| `GET /trip_status` | — | `{"status": "ok", "total", "boarded", "vessel", "route", "departure"}` — progress for the loaded trip |
+| `POST /sync` | `{"trip_id": N}` | `{"status": "success", "trip_id": N, "tickets": N}` (missing trip_id → `{"status": "failed", "reason"}`) |
+| `POST /verify` | `{"qr_token": "<scanned string>"}` | success: `{"status": "success", "passenger_name", "route", "vessel", "seat_number", "accommodation_class", "departure", "ticket_status", "already_boarded", "boarded_at"}` — the ticket is flipped to `Boarded` on the first scan; `already_boarded` is true on repeat scans · not found / cancelled / refunded: `{"status": "failed", "reason"}` |
+
+The local `verification_tickets` table adds two columns beyond the cloud
+export: `boarding_status` (`Not Boarded` → `Boarded`) and `boarded_at`
+(scan time), used for progress and duplicate-scan warnings.
 
 Environment overrides (set in `docker-compose.yml`, all optional):
 `CLOUD_API_URL` (central backend, default
 `https://aleson-test-2.brylletan.com`), `LOCAL_DATABASE_URL`,
-`SYNC_PAGE_SIZE`.
+`SYNC_PAGE_SIZE`, `TRIP_GRACE_HOURS` (how long after departure a trip stays
+in the picker, default 3).
