@@ -26,6 +26,9 @@ PAGE_SIZE = int(os.getenv("SYNC_PAGE_SIZE", "20000"))
 # Trips that departed within this window still show in the picker, so a trip
 # that is already boarding doesn't disappear from the list mid-session.
 UPCOMING_GRACE = timedelta(hours=int(os.getenv("TRIP_GRACE_HOURS", "3")))
+# Pre-shared key for the cloud's gate-staff export, which serves password
+# hashes and so is not public. Must match GATE_SYNC_SECRET on the backend.
+GATE_SYNC_SECRET = os.getenv("GATE_SYNC_SECRET", "")
 
 CREATE_TABLE_SQL = """
     CREATE TABLE IF NOT EXISTS verification_tickets (
@@ -33,6 +36,7 @@ CREATE_TABLE_SQL = """
         qr_token VARCHAR(36) UNIQUE NOT NULL,
         passenger_first_name TEXT NOT NULL,
         passenger_last_name TEXT NOT NULL,
+        passenger_nationality TEXT,
         seat_number TEXT NOT NULL,
         status TEXT NOT NULL,
         accommodation_class TEXT,
@@ -52,15 +56,54 @@ MIGRATE_STATEMENTS = (
     "ADD COLUMN IF NOT EXISTS boarding_status TEXT NOT NULL DEFAULT 'Not Boarded';",
     "ALTER TABLE verification_tickets "
     "ADD COLUMN IF NOT EXISTS boarded_at TIMESTAMP NULL;",
+    # Nationality is required on a coast-guard passenger manifest.
+    "ALTER TABLE verification_tickets "
+    "ADD COLUMN IF NOT EXISTS passenger_nationality TEXT;",
 )
 
-# Columns loaded from the cloud export. boarding_status / boarded_at are
-# intentionally omitted so they take their table defaults on load.
+# Columns loaded from the cloud export. boarding_status is derived after the
+# COPY (from boarded_at) rather than transferred, since the cloud has no such
+# column — see sync_database.
 COLUMNS = (
     "id", "qr_token", "passenger_first_name", "passenger_last_name",
-    "seat_number", "status", "accommodation_class", "scheduled_departure",
-    "vessel", "origin_port", "destination_port",
+    "passenger_nationality", "seat_number", "status", "accommodation_class",
+    "scheduled_departure", "vessel", "origin_port", "destination_port",
+    "boarded_at",
 )
+
+# Gate-staff accounts, synced down so logins on the console work with no
+# internet at the pier. Refreshed alongside every ticket sync (see
+# sync_database) rather than on its own schedule, since both already require
+# the same cloud round trip.
+GATE_STAFF_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS gate_staff (
+        id INT PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        synced_at TIMESTAMP NOT NULL DEFAULT now()
+    );
+"""
+
+GATE_STAFF_COLUMNS = ("id", "name", "email", "password_hash")
+
+
+def fetch_gate_staff() -> list[dict]:
+    if not GATE_SYNC_SECRET:
+        raise SyncError(
+            "GATE_SYNC_SECRET is not set on this laptop — cannot download the "
+            "gate-staff roster. Set it to match the backend and retry."
+        )
+    with httpx.Client(timeout=30) as client:
+        try:
+            response = client.get(
+                f"{CLOUD_API_URL}/api/v1/gate-staff",
+                headers={"X-Gate-Sync-Key": GATE_SYNC_SECRET},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as e:
+            raise SyncError(f"cloud API request failed: {e}") from e
+    return response.json().get("staff", [])
 
 
 class SyncError(RuntimeError):
@@ -121,10 +164,13 @@ def fetch_upcoming_trips() -> list[dict]:
 
 
 def sync_database(trip_id: int) -> dict:
-    """Download one trip's tickets from the cloud API and rebuild the table."""
+    """Download one trip's tickets and the gate-staff roster from the cloud
+    API and rebuild both local tables in one transaction.
+    """
     if trip_id is None:
         raise SyncError("trip_id is required")
     tickets = fetch_all_tickets(trip_id)
+    staff = fetch_gate_staff()
 
     try:
         with psycopg.connect(LOCAL_DATABASE_URL) as conn:
@@ -132,16 +178,60 @@ def sync_database(trip_id: int) -> dict:
                 cur.execute(CREATE_TABLE_SQL)
                 for statement in MIGRATE_STATEMENTS:
                     cur.execute(statement)
+
+                # Re-syncing mid-boarding must not lose who already boarded:
+                # this table is rebuilt by TRUNCATE + COPY, so snapshot the
+                # local boarding state first and re-apply it afterwards.
+                # Without this, a second Download silently resets everyone to
+                # 'Not Boarded' and duplicate-scan detection stops working.
+                cur.execute("""
+                    CREATE TEMP TABLE boarding_snapshot ON COMMIT DROP AS
+                    SELECT qr_token, boarded_at FROM verification_tickets
+                    WHERE boarding_status = 'Boarded';
+                """)
+
                 cur.execute("TRUNCATE verification_tickets;")
                 with cur.copy(
                     f"COPY verification_tickets ({', '.join(COLUMNS)}) FROM STDIN"
                 ) as copy:
                     for t in tickets:
                         copy.write_row(tuple(t.get(col) for col in COLUMNS))
+
+                # Boarding recorded by any gate (the cloud now carries
+                # boarded_at), then anything this laptop scanned that hasn't
+                # reached the cloud yet — local wins, since it is strictly
+                # newer than what we just downloaded.
+                cur.execute("""
+                    UPDATE verification_tickets
+                    SET boarding_status = 'Boarded'
+                    WHERE boarded_at IS NOT NULL;
+                """)
+                cur.execute("""
+                    UPDATE verification_tickets vt
+                    SET boarding_status = 'Boarded',
+                        boarded_at = COALESCE(vt.boarded_at, s.boarded_at)
+                    FROM boarding_snapshot s
+                    WHERE vt.qr_token = s.qr_token;
+                """)
+                restored = cur.rowcount
+
+                cur.execute(GATE_STAFF_TABLE_SQL)
+                cur.execute("TRUNCATE gate_staff;")
+                with cur.copy(
+                    f"COPY gate_staff ({', '.join(GATE_STAFF_COLUMNS)}) FROM STDIN"
+                ) as copy:
+                    for s in staff:
+                        copy.write_row(tuple(s.get(col) for col in GATE_STAFF_COLUMNS))
     except psycopg.Error as e:
         raise SyncError(f"local database load failed: {e}") from e
 
-    return {"status": "success", "trip_id": trip_id, "tickets": len(tickets)}
+    return {
+        "status": "success",
+        "trip_id": trip_id,
+        "tickets": len(tickets),
+        "gate_staff": len(staff),
+        "boarding_preserved": restored,
+    }
 
 
 if __name__ == "__main__":
