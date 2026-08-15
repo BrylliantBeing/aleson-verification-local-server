@@ -28,6 +28,11 @@ services:
       # Inside the compose network the DB is reachable as db:5432.
       LOCAL_DATABASE_URL: postgresql://aleson_local:aleson_local_gate@db:5432/aleson_db
       CLOUD_API_URL: https://aleson-test-2.brylletan.com
+      # Shared secret for pulling GET /api/v1/gate-staff from the cloud backend;
+      # sync.py sends it as X-Gate-Sync-Key. Must match GATE_SYNC_SECRET there
+      # exactly or the pull 401s and staff cannot log in offline. Kept out of
+      # this file — compose reads it from .env alongside this compose file.
+      GATE_SYNC_SECRET: ${GATE_SYNC_SECRET:?set GATE_SYNC_SECRET in .env next to docker-compose.yml}
     ports:
       - "8001:8001"
 
