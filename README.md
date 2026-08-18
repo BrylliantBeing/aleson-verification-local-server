@@ -81,6 +81,6 @@ export: `boarding_status` (`Not Boarded` → `Boarded`) and `boarded_at`
 
 Environment overrides (set in `docker-compose.yml`, all optional):
 `CLOUD_API_URL` (central backend, default
-`https://aleson-test-2.brylletan.com`), `LOCAL_DATABASE_URL`,
+`https://aleson-shipping.com`), `LOCAL_DATABASE_URL`,
 `SYNC_PAGE_SIZE`, `TRIP_GRACE_HOURS` (how long after departure a trip stays
 in the picker, default 3).

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import httpx
 import psycopg
 
-CLOUD_API_URL = os.getenv("CLOUD_API_URL", "https://aleson-test-2.brylletan.com").rstrip("/")
+CLOUD_API_URL = os.getenv("CLOUD_API_URL", "https://aleson-shipping.com").rstrip("/")
 LOCAL_DATABASE_URL = os.getenv(
     "LOCAL_DATABASE_URL",
     "postgresql://aleson_local:aleson_local_gate@localhost:5433/aleson_db",
@@ -86,6 +86,34 @@ GATE_STAFF_TABLE_SQL = """
 """
 
 GATE_STAFF_COLUMNS = ("id", "name", "email", "password_hash")
+
+# Which cloud trip the local tables currently hold. `verification_tickets` is a
+# flat ticket export with no trip column, so without this the laptop knows every
+# passenger on the sailing but not which trip row they belong to — and so cannot
+# report the departure back up. Single row, id = 1.
+LOCAL_STATE_SQL = """
+    CREATE TABLE IF NOT EXISTS local_state (
+        id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        trip_id INT,
+        synced_at TIMESTAMP NOT NULL DEFAULT now(),
+        manifest_printed_at TIMESTAMP NULL
+    );
+"""
+
+
+def current_trip_id() -> int | None:
+    """The trip the last /sync downloaded, or None on a laptop that predates
+    local_state (or has never synced)."""
+    try:
+        with psycopg.connect(LOCAL_DATABASE_URL, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute(LOCAL_STATE_SQL)
+                cur.execute("SELECT trip_id FROM local_state WHERE id = 1")
+                row = cur.fetchone()
+        return row[0] if row else None
+    except psycopg.Error as e:
+        print(f"[local_state] could not read current trip: {e}")
+        return None
 
 
 def fetch_gate_staff() -> list[dict]:
@@ -222,6 +250,22 @@ def sync_database(trip_id: int) -> dict:
                 ) as copy:
                     for s in staff:
                         copy.write_row(tuple(s.get(col) for col in GATE_STAFF_COLUMNS))
+
+                # Remember which trip is loaded, and clear any previous
+                # manifest-print stamp — a fresh download is a new boarding
+                # session, so the next print must report departure again.
+                cur.execute(LOCAL_STATE_SQL)
+                cur.execute(
+                    """
+                    INSERT INTO local_state (id, trip_id, synced_at, manifest_printed_at)
+                    VALUES (1, %s, now(), NULL)
+                    ON CONFLICT (id) DO UPDATE
+                        SET trip_id = EXCLUDED.trip_id,
+                            synced_at = now(),
+                            manifest_printed_at = NULL
+                    """,
+                    (trip_id,),
+                )
     except psycopg.Error as e:
         raise SyncError(f"local database load failed: {e}") from e
 

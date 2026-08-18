@@ -13,6 +13,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import bcrypt
 import psycopg
@@ -21,8 +22,14 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from .outbox import OUTBOX_RETRY_SECONDS, ensure_table as ensure_outbox_table, push_pending_events, record_boarding_event
-from .sync import SyncError, fetch_upcoming_trips, sync_database
+from .outbox import (
+    OUTBOX_RETRY_SECONDS,
+    ensure_table as ensure_outbox_table,
+    push_pending_events,
+    record_boarding_event,
+    record_trip_departure,
+)
+from .sync import SyncError, current_trip_id, fetch_upcoming_trips, sync_database
 from .web import INDEX_HTML
 
 LOCAL_DATABASE_URL = os.getenv(
@@ -192,11 +199,52 @@ def trip_status():
     }
 
 
+def _mark_departed_on_manifest(staff: dict) -> dict:
+    """Printing the manifest is the last thing that happens before a vessel
+    casts off, so it is what sets the trip Departed in the cloud.
+
+    Recorded locally first and pushed by the outbox, never inline: the pier is
+    routinely offline, and the manifest must print regardless. The cloud
+    endpoint only promotes a Scheduled/Boarding trip and never re-stamps
+    actual_departure, so a reprint is harmless.
+    """
+    trip_id = current_trip_id()
+    if trip_id is None:
+        # A laptop that has not synced since this feature shipped has no trip id
+        # to report against. The manifest still prints; departure stays manual.
+        print("[manifest] no trip id in local_state — departure not reported")
+        return {"reported": False, "reason": "no synced trip on this laptop"}
+
+    departed_at = datetime.now()
+    try:
+        with psycopg.connect(LOCAL_DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE local_state SET manifest_printed_at = "
+                    "COALESCE(manifest_printed_at, %s) WHERE id = 1",
+                    (departed_at,),
+                )
+        record_trip_departure(trip_id, departed_at, staff["staff_id"])
+    except Exception as e:
+        # Never let this stop the manifest — the paper list is the point.
+        print(f"[manifest] could not queue departure for trip {trip_id}: {e}")
+        return {"reported": False, "reason": str(e)}
+
+    print(f"[manifest] trip {trip_id} marked Departed by {staff['name']} "
+          f"(staff_id={staff['staff_id']}); queued for the cloud")
+    return {"reported": True, "trip_id": trip_id, "departed_at": departed_at.isoformat()}
+
+
 @app.get("/manifest")
-def manifest(staff: dict = Depends(require_session)):
+def manifest(staff: dict = Depends(require_session), mark_departed: bool = True):
     """Full passenger list for the trip currently loaded in the local DB, for
     the gate laptop to export/print before departure. Guarded like /verify
     since it's the same kind of boarding-relevant record.
+
+    Exporting also reports the trip as Departed to the cloud (see
+    _mark_departed_on_manifest) — the operator no longer has to remember to flip
+    the status by hand in the admin dashboard afterwards. Pass
+    `?mark_departed=false` to take a copy of the list without doing that.
     """
     with psycopg.connect(LOCAL_DATABASE_URL, connect_timeout=3) as conn:
         with conn.cursor() as cur:
@@ -213,6 +261,12 @@ def manifest(staff: dict = Depends(require_session)):
 
     print(f"[manifest] exported by {staff['name']} (staff_id={staff['staff_id']}), {len(rows)} passengers")
 
+    departure_report = (
+        _mark_departed_on_manifest(staff)
+        if mark_departed
+        else {"reported": False, "reason": "mark_departed=false"}
+    )
+
     vessel, origin, destination, departure = (None, None, None, None)
     if rows:
         vessel, origin, destination, departure = rows[0][6], rows[0][7], rows[0][8], rows[0][9]
@@ -223,6 +277,7 @@ def manifest(staff: dict = Depends(require_session)):
         "route": f"{origin} → {destination}" if origin and destination else None,
         "departure": departure.isoformat() if departure else None,
         "exported_by": staff["name"],
+        "departure_reported": departure_report,
         "passengers": [
             {
                 "passenger_name": f"{r[0]} {r[1]}",
@@ -286,14 +341,21 @@ def push_boarding():
 
 @app.get("/outbox_status")
 def outbox_status():
-    """How many boarded-scan events are still waiting to reach the cloud."""
+    """How much still has to reach the cloud: boarded scans, and any departure
+    reported by printing the manifest."""
     try:
         ensure_outbox_table()
         with psycopg.connect(LOCAL_DATABASE_URL, connect_timeout=3) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT count(*) FROM boarding_events WHERE synced = false")
                 pending = cur.fetchone()[0]
-        return {"status": "ok", "pending": pending}
+                cur.execute("SELECT count(*) FROM trip_departure_events WHERE synced = false")
+                departures_pending = cur.fetchone()[0]
+        return {
+            "status": "ok",
+            "pending": pending,
+            "departures_pending": departures_pending,
+        }
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 

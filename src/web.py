@@ -73,6 +73,14 @@ INDEX_HTML = """<!doctype html>
     width: 100%; font: inherit; padding: 10px 12px; border-radius: 8px;
     border: 1px solid #334155; background: #0f172a; color: #e2e8f0;
   }
+  .field .with-toggle { position: relative; }
+  .field .with-toggle input { padding-right: 68px; }
+  .reveal-btn {
+    position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+    background: none; color: #94a3b8; font-size: 13px; font-weight: 600;
+    padding: 6px 10px;
+  }
+  .reveal-btn:hover { background: #334155; color: #e2e8f0; }
   .login-wrap button { width: 100%; margin-top: 4px; }
   .login-error { color: #f87171; font-size: 14px; margin-top: 10px; min-height: 1em; }
   .pairing-code {
@@ -98,7 +106,11 @@ INDEX_HTML = """<!doctype html>
   </div>
   <div class="field">
     <label>Password</label>
-    <input id="login-password" type="password" autocomplete="current-password" />
+    <div class="with-toggle">
+      <input id="login-password" type="password" autocomplete="current-password" />
+      <button id="reveal-btn" type="button" class="reveal-btn"
+              aria-label="Show password" aria-pressed="false">Show</button>
+    </div>
   </div>
   <button id="login-btn">Log in</button>
   <div id="login-error" class="login-error"></div>
@@ -134,10 +146,15 @@ INDEX_HTML = """<!doctype html>
       <div class="progress-wrap"><div id="progress-bar" class="progress-bar"></div></div>
       <div><span id="progress-num" class="progress-num">0<small> / 0 boarded</small></span></div>
       <div class="trip" style="margin-top:14px">
-        <button id="export-manifest-btn">Export Manifest (PDF)</button>
+        <button id="export-manifest-btn">Print Manifest &amp; Depart</button>
         <button id="force-sync-btn" style="background:#334155">Force Sync</button>
         <span id="outbox-status" class="muted" style="font-size:13px"></span>
       </div>
+      <p class="muted" style="font-size:13px;margin:10px 0 0">
+        Printing the manifest also marks this trip <strong>Departed</strong> in the
+        admin dashboard. It is queued locally first, so it still works with no
+        internet at the pier.
+      </p>
     </div>
   </section>
 
@@ -176,6 +193,12 @@ function showLogin() {
   localStorage.removeItem("gate_session");
   $("console-view").style.display = "none";
   $("login-view").style.display = "";
+  // Never hand the next staffer a revealed field on a shared gate laptop.
+  $("login-password").value = "";
+  $("login-password").type = "password";
+  $("reveal-btn").textContent = "Show";
+  $("reveal-btn").setAttribute("aria-label", "Show password");
+  $("reveal-btn").setAttribute("aria-pressed", "false");
 }
 
 async function doLogin() {
@@ -203,6 +226,16 @@ async function doLogin() {
 
 $("login-btn").onclick = doLogin;
 $("login-password").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+$("reveal-btn").onclick = () => {
+  const field = $("login-password");
+  const shown = field.type === "text";
+  field.type = shown ? "password" : "text";
+  const btn = $("reveal-btn");
+  btn.textContent = shown ? "Show" : "Hide";
+  btn.setAttribute("aria-label", shown ? "Show password" : "Hide password");
+  btn.setAttribute("aria-pressed", shown ? "false" : "true");
+  field.focus();
+};
 $("logout-btn").onclick = showLogin;
 $("export-manifest-btn").onclick = exportManifest;
 $("force-sync-btn").onclick = forceSyncBoarding;
@@ -306,9 +339,16 @@ async function refreshOutboxStatus() {
     const s = await res.json();
     const box = $("outbox-status");
     if (s.status !== "ok") { box.textContent = ""; return; }
-    box.textContent = s.pending > 0
-      ? `${s.pending} boarding scan${s.pending === 1 ? "" : "s"} waiting to sync`
-      : "All boarding scans synced";
+    const parts = [];
+    if (s.pending > 0) {
+      parts.push(`${s.pending} boarding scan${s.pending === 1 ? "" : "s"} waiting to sync`);
+    }
+    // A reported departure that has not reached the cloud yet means the trip is
+    // still showing as Scheduled in the dashboard — worth saying out loud.
+    if (s.departures_pending > 0) {
+      parts.push(`${s.departures_pending} departure report${s.departures_pending === 1 ? "" : "s"} waiting to sync`);
+    }
+    box.textContent = parts.length ? parts.join(" · ") : "All boarding data synced";
   } catch (e) { /* keep last known state */ }
 }
 
@@ -382,9 +422,18 @@ function printManifestDocument(html) {
   }, 150);
 }
 
+// Printing the manifest is the last step before the vessel casts off, so it is
+// what reports the trip as Departed to the cloud. Confirmed once, because it
+// changes the trip's status in the admin dashboard.
 async function exportManifest() {
   const btn = $("export-manifest-btn");
   const original = btn.textContent;
+  const proceed = window.confirm(
+    "Print the passenger manifest?\\n\\n" +
+    "This also marks the loaded trip as DEPARTED in the admin dashboard. " +
+    "Only do this once boarding is closed."
+  );
+  if (!proceed) return;
   btn.disabled = true; btn.textContent = "Preparing manifest…";
   try {
     const res = await fetch("/manifest", { headers: authHeaders() });
@@ -392,6 +441,17 @@ async function exportManifest() {
     const data = await res.json();
     if (data.status !== "ok") throw new Error(data.detail || "Failed to load manifest");
     printManifestDocument(buildManifestHtml(data));
+    const report = data.departure_reported || {};
+    if (report.reported) {
+      toast("Manifest printed — trip marked Departed (queued for the cloud)", "ok");
+    } else {
+      toast(
+        "Manifest printed, but departure was NOT reported: " +
+        (report.reason || "unknown reason") + ". Set the status by hand.",
+        "err"
+      );
+    }
+    refreshOutboxStatus();
   } catch (e) {
     toast("Manifest export failed: " + e.message, "err");
   } finally {
