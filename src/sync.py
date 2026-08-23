@@ -139,6 +139,11 @@ class SyncError(RuntimeError):
 
 
 def fetch_all_tickets(trip_id: int) -> list[dict]:
+    if not GATE_SYNC_SECRET:
+        raise SyncError(
+            "GATE_SYNC_SECRET is not set on this laptop - cannot download the "
+            "trip manifest. Set it to match the backend and retry."
+        )
     tickets: list[dict] = []
     after_id = 0
     with httpx.Client(timeout=120) as client:
@@ -147,6 +152,7 @@ def fetch_all_tickets(trip_id: int) -> list[dict]:
                 response = client.get(
                     f"{CLOUD_API_URL}/api/v1/verification/tickets",
                     params={"after_id": after_id, "limit": PAGE_SIZE, "trip_id": trip_id},
+                    headers={"X-Gate-Sync-Key": GATE_SYNC_SECRET},
                 )
                 response.raise_for_status()
             except httpx.HTTPError as e:

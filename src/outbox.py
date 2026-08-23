@@ -15,6 +15,11 @@ import httpx
 import psycopg
 
 CLOUD_API_URL = os.getenv("CLOUD_API_URL", "https://aleson-shipping.com").rstrip("/")
+# The cloud now gates the /verification write endpoints to the gate clients.
+# This laptop holds no session, so it authenticates with the same pre-shared
+# key it already uses for the roster and manifest pulls (see sync.py).
+GATE_SYNC_SECRET = os.getenv("GATE_SYNC_SECRET", "")
+GATE_SYNC_HEADERS = {"X-Gate-Sync-Key": GATE_SYNC_SECRET}
 LOCAL_DATABASE_URL = os.getenv(
     "LOCAL_DATABASE_URL",
     "postgresql://aleson_local:aleson_local_gate@localhost:5433/aleson_db",
@@ -109,6 +114,7 @@ def _push_pending_departures() -> dict:
                         "departed_at": departed_at.isoformat(),
                         "reported_by_fk": reported_by_fk,
                     },
+                    headers=GATE_SYNC_HEADERS,
                 )
                 response.raise_for_status()
                 pushed_ids.append(row_id)
@@ -195,6 +201,7 @@ def push_pending_events() -> dict:
             response = client.post(
                 f"{CLOUD_API_URL}/api/v1/verification/boarding-events",
                 json={"events": events},
+                headers=GATE_SYNC_HEADERS,
             )
             response.raise_for_status()
     except httpx.HTTPError as e:
