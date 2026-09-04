@@ -302,9 +302,16 @@ async function downloadTrip(tripId, route, btn) {
   try {
     const res = await fetch("/sync", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      // Downloading a trip TRUNCATEs and rebuilds the local ticket table, so
+      // the server requires a session for it on any laptop that has already
+      // synced a roster. Only a first-time provisioning sync is unauthenticated,
+      // because until one has run there is nobody to log in as.
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ trip_id: tripId }),
     });
+    if (res.status === 401) {
+      throw new Error("log in first to download a different sailing");
+    }
     const data = await res.json();
     if (data.status !== "success") throw new Error(data.reason || "failed");
     toast(`Downloaded ${route}: ${data.tickets} tickets`, "ok");
@@ -374,10 +381,18 @@ async function forceSyncBoarding() {
   }
 }
 
+// The number painted on the seat. A seat_map name must be unique across the
+// whole vessel, but the painted numbers repeat between classes (M/V Antonia 2
+// has an Economy 42 and an Aircon 42), so those seats are stored with a
+// hyphenated class prefix: ECO-42, AC-42. Crew read the bare number.
+function seatNumberLabel(seatNumber) {
+  return String(seatNumber || "").replace(/^[A-Z]{2,4}-(?=[0-9])/, "");
+}
+
 function buildManifestHtml(data) {
   const rows = (data.passengers || []).map((p) => `
     <tr>
-      <td>${p.seat_number || ""}</td>
+      <td>${seatNumberLabel(p.seat_number)}</td>
       <td>${p.passenger_name}</td>
       <td>${p.nationality || ""}</td>
       <td>${p.accommodation_class || ""}</td>
