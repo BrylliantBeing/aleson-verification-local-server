@@ -59,12 +59,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Aleson Verification Local Server", lifespan=lifespan)
 
+# The gate console is served by this app at `/`, so it is same-origin and needs
+# no CORS entry at all. The tablets are native apps and send no Origin.
+#
+# `allow_origins=["*"]` with `allow_credentials=True` was therefore permission
+# nobody here was asking for — and Starlette does not treat that pair as the
+# no-op the CORS spec intends: it echoes the caller's own Origin back, which is
+# full credentialed access rather than none. Any page the laptop's browser
+# happened to load could then drive this server, and it holds a whole sailing's
+# passenger manifest and the boarding state the gate runs on.
+#
+# Anything genuinely cross-origin (a browser tool on the pier LAN) goes in
+# GATE_ALLOWED_ORIGINS as an explicit comma-separated list.
+_gate_origins = [o.strip() for o in os.getenv("GATE_ALLOWED_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_gate_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -292,11 +305,42 @@ def manifest(staff: dict = Depends(require_session), mark_departed: bool = True)
     }
 
 
+# Failed-login throttle, in memory alongside SESSIONS. {email: [timestamps]}.
+# This server holds a full copy of the gate-staff bcrypt hashes and answers
+# guesses locally, so an unthrottled /login is an online oracle sitting on the
+# pier LAN for anyone who can reach port 8001. bcrypt makes each guess costly;
+# this makes a sustained run impossible rather than merely slow.
+LOGIN_ATTEMPT_LIMIT = 10
+LOGIN_ATTEMPT_WINDOW_SECONDS = 300
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+
+
+def _check_login_throttle(email: str) -> None:
+    """Raise 429 once one address has burned through its recent attempts.
+
+    Keyed on the address rather than the caller: every tablet on the gate's
+    hotspot shares one NAT address, so an IP key would let one attacker lock out
+    the whole gate. Cleared on success, so a checker who mistypes twice and then
+    gets it right starts fresh.
+    """
+    now = time.time()
+    recent = [t for t in _LOGIN_ATTEMPTS.get(email, [])
+              if now - t < LOGIN_ATTEMPT_WINDOW_SECONDS]
+    _LOGIN_ATTEMPTS[email] = recent
+    if len(recent) >= LOGIN_ATTEMPT_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed sign-ins. Wait a few minutes and try again.",
+        )
+
+
 @app.post("/login")
 def login(req: LoginRequest):
     """Authenticate a gate staffer against the locally synced roster (works
     offline — see sync.fetch_gate_staff) and issue a pairing-code session.
     """
+    throttle_key = req.email.strip().lower()
+    _check_login_throttle(throttle_key)
     with psycopg.connect(LOCAL_DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -306,8 +350,10 @@ def login(req: LoginRequest):
             row = cur.fetchone()
 
     if row is None or not bcrypt.checkpw(req.password.encode(), row[2].encode()):
+        _LOGIN_ATTEMPTS.setdefault(throttle_key, []).append(time.time())
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
+    _LOGIN_ATTEMPTS.pop(throttle_key, None)
     staff_id, name, _hash = row
     token = _generate_pairing_code()
     while token in SESSIONS:
@@ -320,11 +366,43 @@ def login(req: LoginRequest):
     return {"token": token, "staff_id": staff_id, "name": name}
 
 
+def _has_local_roster() -> bool:
+    """Whether a gate-staff roster has already been synced onto this laptop.
+
+    This is what distinguishes a freshly provisioned machine, which has nobody
+    to authenticate as yet, from one mid-boarding that does.
+    """
+    try:
+        with psycopg.connect(LOCAL_DATABASE_URL, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM gate_staff LIMIT 1")
+                return cur.fetchone() is not None
+    except Exception:
+        # No table yet (never synced) or no database — either way, nothing to
+        # authenticate against, so treat it as a fresh laptop.
+        return False
+
+
 @app.post("/sync")
-def sync(req: SyncRequest):
-    """Download one trip's tickets from the cloud API into the local Postgres."""
+def sync(req: SyncRequest, authorization: str | None = Header(default=None)):
+    """Download one trip's tickets from the cloud API into the local Postgres.
+
+    Requires a gate-staff session UNLESS this laptop has never synced a roster.
+    That exception is what keeps first-time provisioning possible: gate_staff
+    accounts only exist locally once a sync has pulled them down, so a blanket
+    session requirement here would be a lockout nobody could clear.
+
+    Everything after that first sync is gated, because this is destructive.
+    sync_database TRUNCATEs the ticket table and rebuilds it for whichever trip
+    it is handed, so an open endpoint let anyone on the pier LAN or hotspot
+    repoint the gate at a different sailing mid-boarding — discarding the
+    boarding state for the sailing actually at the pier, and pulling down
+    another sailing's full passenger manifest for the asking.
+    """
     if req.trip_id is None:
         return {"status": "failed", "reason": "trip_id is required"}
+    if _has_local_roster():
+        require_session(authorization)
     try:
         return sync_database(req.trip_id)
     except SyncError as e:
